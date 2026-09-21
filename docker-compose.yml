@@ -1,0 +1,83 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5433}:5432"]
+    environment:
+      POSTGRES_DB: tracker
+      POSTGRES_USER: tracker
+      POSTGRES_PASSWORD: tracker
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes: [postgres_data:/var/lib/postgresql/data]
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment: &backend_environment
+      DATABASE_URL: postgresql+psycopg://tracker:tracker@postgres:5432/tracker
+      REDIS_URL: redis://redis:6379/0
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      NOTIFY_ENABLED: "false"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    command: sh -c "alembic upgrade head && uvicorn backend.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 15
+    ports: ["127.0.0.1:${BACKEND_PORT:-8000}:8000"]
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *backend_environment
+      NOTIFY_ENABLED: "true"
+      DBUS_SESSION_BUS_ADDRESS: unix:path=/run/user/1000/bus
+      HOME: /tmp
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    volumes:
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/bus:/run/user/1000/bus
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      backend: {condition: service_healthy}
+    command: celery -A backend.workers.tasks.app worker --loglevel=info
+  beat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment: *backend_environment
+    depends_on:
+      redis: {condition: service_healthy}
+      backend: {condition: service_healthy}
+    command: celery -A backend.workers.tasks.app beat --loglevel=info
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    environment:
+      VITE_API_PROXY_TARGET: http://backend:8000
+    depends_on:
+      backend: {condition: service_healthy}
+    ports: ["127.0.0.1:${FRONTEND_PORT:-5173}:5173"]
+volumes:
+  postgres_data:

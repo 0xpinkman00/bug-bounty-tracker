@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+*.log
+celerybeat-schedule*
+.coverage
+htmlcov/
