@@ -28,7 +28,7 @@ crontab -l
 tail -F ~/.local/state/bug-bounty-tracker/releases.log
 ```
 
-The installer updates only its marked crontab entry and can be run again safely. Set `GITHUB_TOKEN` in `.env` for GitHub's authenticated rate limit. The **Releases** page shows only the latest run: every repository checked, releases found, and errors. Each run also replaces `~/.local/state/bug-bounty-tracker/releases.log` with its timestamped text log. Keep the Docker stack running separately with `docker compose up --build -d`. Cron runs while you are logged out if the computer is on; it does not catch up missed jobs when the computer is off at 21:00.
+The installer updates only its marked crontab entry and can be run again safely. Set `GITHUB_TOKEN` in `.env` for GitHub's authenticated rate limit. The **Releases** page shows only the latest run: every repository checked, releases found, errors, and whether the Ubuntu notification was sent. Each run also replaces `~/.local/state/bug-bounty-tracker/releases.log` with its timestamped text log. After the scan, the host sends one desktop summary if **New releases** is enabled in Settings and an Ubuntu desktop notification session is available. Keep the Docker stack running separately with `docker compose up --build -d`. Cron runs while you are logged out if the computer is on; it does not catch up missed jobs when the computer is off at 21:00.
 
 ## Tests
 

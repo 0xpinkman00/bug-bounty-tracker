@@ -44,7 +44,7 @@ def send_notifications() -> None:
         with SessionLocal() as db:
             prefs = db.get(Setting, 'notifications')
             enabled = prefs.value.get('enabled', DEFAULT_TYPES) if prefs else DEFAULT_TYPES
-            rows = db.scalars(select(Event).where(Event.event_type.in_(enabled)).order_by(Event.id).limit(100)).all()
+            rows = db.scalars(select(Event).where(Event.event_type.in_(enabled), Event.event_type != 'NEW_RELEASE').order_by(Event.id).limit(100)).all()
             for item in rows:
                 marker = db.get(Setting, f'notified:{item.id}')
                 if marker:
@@ -59,4 +59,3 @@ def send_notifications() -> None:
 def sync_source_run(run_id: int) -> None:
     from backend.services.discovery import synchronize_source_run
     asyncio.run(synchronize_source_run(run_id))
-

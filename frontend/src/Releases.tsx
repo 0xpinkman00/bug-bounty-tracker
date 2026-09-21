@@ -18,6 +18,7 @@ export function Releases(){
           <span>Started {formatDate(run.started_at)}</span>
           {run.completed_at&&<span>Finished {formatDate(run.completed_at)}</span>}
           {run.error_count>0&&<span>{run.error_count} errors</span>}
+          {run.notification_status&&run.notification_status!=='pending'&&<span>Ubuntu notification: {run.notification_status}</span>}
         </div>
         {run.repositories.length?<div className="data-table-wrap"><table className="data-table"><thead><tr><th>Repository checked</th><th>GitHub releases</th><th>Found in this run</th></tr></thead><tbody>{run.repositories.map(entry=><tr key={entry.repository_id}>
           <td><Link className="table-title" to={'/repositories/'+entry.repository_id}>{entry.repository}</Link></td>

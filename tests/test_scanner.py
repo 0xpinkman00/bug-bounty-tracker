@@ -60,8 +60,16 @@ async def test_daily_poll_logs_repositories_and_new_releases(monkeypatch, caplog
         async def close(self):
             pass
 
+    notifications = []
+
+    class Notifier:
+        async def send_text(self, title, message):
+            notifications.append((title, message))
+            return True
+
     monkeypatch.setattr(release_job, 'SessionLocal', sessionmaker(engine))
     monkeypatch.setattr(release_job, 'GitHubClient', Client)
+    monkeypatch.setattr(release_job, 'UbuntuNotificationProvider', Notifier)
     with caplog.at_level('INFO', logger='backend.github.releases'):
         assert await poll_all_releases() == 0
         assert await poll_all_releases() == 0
@@ -70,11 +78,20 @@ async def test_daily_poll_logs_repositories_and_new_releases(monkeypatch, caplog
     assert '"tag": "v1"' in caplog.text
     assert 'checked org/repo: 1 releases returned, 0 new' in caplog.text
     assert '1 repositories checked, 1 new releases, 0 errors' in caplog.text
+    assert len(notifications) == 2
+    assert notifications[0] == ('GitHub release check finished', 'Checked 1 repositories. Found 1 new releases. 0 checks failed. Open Releases for details.')
     with Session(engine) as db:
         latest = db.get(Setting, 'latest_release_poll').value
         assert latest['status'] == 'completed'
+        assert latest['notification_status'] == 'sent'
         assert latest['checked_count'] == 1
         assert latest['new_release_count'] == 0
         assert latest['repositories'][0]['repository'] == 'org/repo'
         assert latest['repositories'][0]['new_releases'] == []
         assert latest_release_run(db) == latest
+        db.add(Setting(key='notifications', value={'enabled': []}))
+        db.commit()
+    assert await poll_all_releases() == 0
+    assert len(notifications) == 2
+    with Session(engine) as db:
+        assert latest_release_run(db)['notification_status'] == 'disabled'

@@ -14,6 +14,7 @@ from backend.database import SessionLocal
 from backend.github.client import GitHubClient
 from backend.github.scanner import event, parse_date
 from backend.models import Release, Repository, Setting
+from backend.notifications.ubuntu import UbuntuNotificationProvider
 
 log = logging.getLogger(__name__)
 LATEST_RUN_KEY = 'latest_release_poll'
@@ -55,7 +56,8 @@ async def poll_all_releases() -> int:
             repo_ids = db.scalars(select(Repository.id).order_by(Repository.id)).all()
             run = {'id': run_id, 'status': 'running', 'started_at': started.isoformat(),
                    'completed_at': None, 'total_repositories': len(repo_ids),
-                   'checked_count': 0, 'new_release_count': 0, 'error_count': 0, 'repositories': []}
+                   'checked_count': 0, 'new_release_count': 0, 'error_count': 0,
+                   'notification_status': 'pending', 'repositories': []}
             save_latest_run(db, run)
     except Exception:
         log.exception('Release poll run %s failed before repositories could be loaded', run_id)
@@ -103,6 +105,24 @@ async def poll_all_releases() -> int:
         save_latest_run(db, run)
     log.info('Release poll run %s finished at %s: %s repositories checked, %s new releases, %s errors',
              run_id, datetime.now(timezone.utc).isoformat(), checked, added, errors)
+    try:
+        with SessionLocal() as db:
+            preference = db.get(Setting, 'notifications')
+            enabled = preference.value.get('enabled', []) if preference else ['NEW_RELEASE']
+        if 'NEW_RELEASE' in enabled:
+            summary = (f'Checked {checked} repositories. Found {added} new releases. '
+                       f'{errors} checks failed. Open Releases for details.')
+            sent = await UbuntuNotificationProvider().send_text('GitHub release check finished', summary)
+            run['notification_status'] = 'sent' if sent else 'unavailable'
+            log.info('Run %s Ubuntu notification: %s', run_id, run['notification_status'])
+        else:
+            run['notification_status'] = 'disabled'
+            log.info('Run %s Ubuntu notification disabled in settings', run_id)
+    except Exception:
+        run['notification_status'] = 'failed'
+        log.exception('Run %s Ubuntu notification failed', run_id)
+    with SessionLocal() as db:
+        save_latest_run(db, run)
     return errors
 
 
