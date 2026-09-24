@@ -79,7 +79,7 @@ async def test_daily_poll_logs_repositories_and_new_releases(monkeypatch, caplog
     assert 'checked org/repo: 1 releases returned, 0 new' in caplog.text
     assert '1 repositories checked, 1 new releases, 0 errors' in caplog.text
     assert len(notifications) == 2
-    assert notifications[0] == ('GitHub release check finished', 'Checked 1 repositories. Found 1 new releases. 0 checks failed. Open Releases for details.')
+    assert notifications[0] == ('GitHub release check finished', 'Checked 1 repositories. Found 1 new releases. 0 checks failed. Open Repositories for details.')
     with Session(engine) as db:
         latest = db.get(Setting, 'latest_release_poll').value
         assert latest['status'] == 'completed'
@@ -95,3 +95,30 @@ async def test_daily_poll_logs_repositories_and_new_releases(monkeypatch, caplog
     assert len(notifications) == 2
     with Session(engine) as db:
         assert latest_release_run(db)['notification_status'] == 'disabled'
+
+
+@pytest.mark.asyncio
+async def test_poll_saves_only_the_most_recent_release() -> None:
+    engine = create_engine('sqlite://', connect_args={'check_same_thread':False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+
+    class ManyReleases(FakeGitHub):
+        async def get(self, path, params=None):
+            if path.endswith('/releases'):
+                return [{'id':23,'tag_name':'v3','name':'Version 3','published_at':'2026-03-01T00:00:00Z','html_url':'https://github.com/org/repo/releases/tag/v3'},
+                        {'id':22,'tag_name':'v2','name':'Version 2','published_at':'2026-02-01T00:00:00Z','html_url':'https://github.com/org/repo/releases/tag/v2'},
+                        {'id':21,'tag_name':'v1','name':'Version 1','published_at':'2026-01-01T00:00:00Z','html_url':'https://github.com/org/repo/releases/tag/v1'}]
+            return await super().get(path, params)
+
+    with Session(engine) as db:
+        client = ManyReleases()
+        repo = await register_repository(db, client, 'https://github.com/org/repo')
+        result = await poll_releases(db, client, repo)
+        assert result.fetched == 3
+        assert [entry['tag'] for entry in result.new_releases] == ['v3']
+        saved = db.scalars(select(Release)).all()
+        assert [row.tag for row in saved] == ['v3']
+        assert repo.last_release_id == 23
+        assert [row.identity for row in db.scalars(select(Event).where(Event.event_type == 'NEW_RELEASE')).all()] == ['23']
+        assert (await poll_releases(db, client, repo)).new_releases == ()
+        assert len(db.scalars(select(Release)).all()) == 1

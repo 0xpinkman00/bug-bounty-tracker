@@ -109,6 +109,15 @@ class ProgramSnapshot(Base):
     raw_data: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
+class ProgramUpdate(Base):
+    """One detected change to a program, recording which parts changed and how."""
+    __tablename__ = 'program_updates'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    program_id: Mapped[int] = mapped_column(ForeignKey('programs.id', ondelete='CASCADE'), index=True)
+    categories: Mapped[list[str]] = mapped_column(JSON, default=list)
+    changes: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
 class ChangedFile(Base):
     __tablename__ = 'changed_files'
     __table_args__ = (UniqueConstraint('commit_id', 'filename'),)

@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from backend.github.client import GitHubClient, normalize_github_url
+from backend.github.client import GitHubClient, RateLimitError, normalize_github_url
 from backend.models import Repository, Commit, Tag, Event, ChangedFile, now
 
 log = logging.getLogger(__name__)
@@ -84,6 +84,12 @@ async def scan_repository(db: Session, client: GitHubClient, repo: Repository) -
         repo.next_scan_at = now() + timedelta(seconds=86400 if repo.archived else repo.scan_interval)
         db.commit()
         log.info('repository scanned', extra={'repository_id': repo.id})
+    except RateLimitError as exc:
+        # Not the repository's fault: retry once the limit resets instead of counting a failure.
+        db.rollback()
+        repo.next_scan_at = exc.reset_at
+        db.commit()
+        raise
     except Exception:
         db.rollback()
         repo.scan_failures += 1

@@ -19,6 +19,8 @@ class SourceProgram:
     assets: list[SourceAsset] = field(default_factory=list)
     repositories: list[str] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+    impacts: list[dict] = field(default_factory=list)  # {'type', 'severity', 'title'}
+    known_issues: list[dict] = field(default_factory=list)  # {'description', 'link'}
 
 class BountySource(ABC):
     @abstractmethod

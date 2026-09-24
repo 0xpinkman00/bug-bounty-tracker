@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Iterator, Literal
+from uuid import uuid4
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,9 +9,10 @@ from sqlalchemy import select, func, case
 from sqlalchemy.orm import Session
 from backend.database import SessionLocal
 from backend.github.client import GitHubClient, GitHubError
+from backend.github.ratelimit import rate_limit_error, rate_limit_status
 from backend.github.scanner import register_repository
-from backend.models import Program, ProgramRepository, Repository, Commit, Release, Tag, Event, Asset, ChangedFile, Setting, SourceSyncRun, now
-from backend.workers.tasks import scan_one, sync_source_run, DEFAULT_TYPES
+from backend.models import Program, ProgramRepository, ProgramUpdate, Repository, Commit, Release, Tag, Event, Asset, ChangedFile, Setting, SourceSyncRun, now
+from backend.workers.tasks import scan_one, scan_releases_now, sync_source_run, DEFAULT_TYPES
 from backend.services.discovery import SOURCE_CLASSES, create_source_run, pause_source_run, resume_source_run, stop_source_run
 
 app = FastAPI(title='Bug Bounty Tracker')
@@ -27,10 +29,11 @@ class RepositoryInput(BaseModel):
 class ProgramInput(BaseModel):
     name: str
     platform: str = 'manual'
-    platform_program_id: str
+    platform_program_id: str | None = None
     program_url: str
     max_bounty: str | None = None
     status: str = 'active'
+    repositories: list[str] = []
 
 class SettingsInput(BaseModel):
     notifications: list[str] = DEFAULT_TYPES
@@ -55,18 +58,26 @@ def serialize(obj) -> dict:
         result[column.name] = value
     return result
 
+def latest_release_ids():
+    """Ids of the most recent release per repository, ignoring older ones already stored."""
+    ranked = select(Release.id.label('id'),
+                    func.row_number().over(partition_by=Release.repository_id,
+                                           order_by=(Release.published_at.desc().nullslast(),
+                                                     Release.id.desc())).label('position')).subquery()
+    return select(ranked.c.id).where(ranked.c.position == 1)
+
 @app.get('/api/overview')
 def overview(db: Session = Depends(get_db)) -> dict:
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     stats = {
         'programs': db.scalar(select(func.count()).select_from(Program)) or 0,
         'repositories': db.scalar(select(func.count()).select_from(Repository)) or 0,
-        'releases': db.scalar(select(func.count()).select_from(Release)) or 0,
-        'releases_7d': db.scalar(select(func.count()).select_from(Release).where(Release.published_at >= cutoff)) or 0,
+        'releases': db.scalar(select(func.count()).select_from(Release).where(Release.id.in_(latest_release_ids()))) or 0,
+        'releases_7d': db.scalar(select(func.count()).select_from(Release).where(Release.id.in_(latest_release_ids()), Release.published_at >= cutoff)) or 0,
         'unread_events': db.scalar(select(func.count()).select_from(Event).where(Event.read_at.is_(None))) or 0,
         'scan_failures': db.scalar(select(func.count()).select_from(Repository).where(Repository.scan_failures > 0)) or 0,
     }
-    recent_releases = db.execute(select(Release, Repository).join(Repository, Release.repository_id == Repository.id).order_by(Release.published_at.desc().nullslast(), Release.id.desc()).limit(6)).all()
+    recent_releases = db.execute(select(Release, Repository).join(Repository, Release.repository_id == Repository.id).where(Release.id.in_(latest_release_ids())).order_by(Release.published_at.desc().nullslast(), Release.id.desc()).limit(6)).all()
     recent_events = db.scalars(select(Event).order_by(Event.created_at.desc(), Event.id.desc()).limit(8)).all()
     repository_ids = {event.repository_id for event in recent_events if event.repository_id}
     program_ids = {event.program_id for event in recent_events if event.program_id}
@@ -82,7 +93,8 @@ def overview(db: Session = Depends(get_db)) -> dict:
 @app.get('/api/programs')
 def programs(db: Session = Depends(get_db), offset: int = 0, limit: int = Query(25, le=100), search: str = '', platform: str = '', repository: Literal['linked', 'unlinked', 'all'] = 'all') -> dict:
     filters = [Program.name.ilike(f'%{search}%')] if search else []
-    if platform: filters.append(Program.platform == platform)
+    if platform == 'other': filters.append(Program.platform.notin_(list(SOURCE_CLASSES)))
+    elif platform: filters.append(Program.platform == platform)
     has_repository = select(ProgramRepository.program_id).where(ProgramRepository.program_id == Program.id).exists()
     if repository == 'linked': filters.append(has_repository)
     if repository == 'unlinked': filters.append(~has_repository)
@@ -97,8 +109,13 @@ def programs(db: Session = Depends(get_db), offset: int = 0, limit: int = Query(
     for predicate in filters:
         query = query.where(predicate)
         count = count.where(predicate)
-    items = [{**serialize(program), 'latest_activity_at': activity.isoformat() if activity else None}
-             for program, activity in db.execute(query.offset(offset).limit(limit))]
+    rows = db.execute(query.offset(offset).limit(limit)).all()
+    latest_ids = (select(func.max(ProgramUpdate.id)).where(ProgramUpdate.program_id.in_([program.id for program, _ in rows]))
+                  .group_by(ProgramUpdate.program_id))
+    latest_updates = {update.program_id: update for update in db.scalars(select(ProgramUpdate).where(ProgramUpdate.id.in_(latest_ids)))} if rows else {}
+    items = [{**serialize(program), 'latest_activity_at': activity.isoformat() if activity else None,
+              'latest_update': serialize(latest_updates[program.id]) if program.id in latest_updates else None}
+             for program, activity in rows]
     return {'items': items, 'total': db.scalar(count), 'offset': offset, 'limit': limit}
 
 @app.get('/api/programs/{program_id}')
@@ -106,17 +123,40 @@ def program_detail(program_id: int, db: Session = Depends(get_db)) -> dict:
     program = db.get(Program, program_id)
     if not program:
         raise HTTPException(404)
-    return {**serialize(program), 'assets': [serialize(x) for x in db.scalars(select(Asset).where(Asset.program_id == program_id))], 'repositories': [serialize(x) for x in program.repositories], 'events': [serialize(x) for x in db.scalars(select(Event).where(Event.program_id == program_id).order_by(Event.id.desc()).limit(50))], 'releases': [serialize(x) for x in db.scalars(select(Release).where(Release.repository_id.in_([r.id for r in program.repositories] or [-1])).order_by(Release.id.desc()).limit(20))]}
+    updates = db.scalars(select(ProgramUpdate).where(ProgramUpdate.program_id == program_id).order_by(ProgramUpdate.id.desc()).limit(50))
+    return {**serialize(program), 'updates': [serialize(x) for x in updates], 'assets': [serialize(x) for x in db.scalars(select(Asset).where(Asset.program_id == program_id))], 'repositories': [serialize(x) for x in program.repositories], 'events': [serialize(x) for x in db.scalars(select(Event).where(Event.program_id == program_id).order_by(Event.id.desc()).limit(50))]}
+
+def default_scan_interval(db: Session) -> int:
+    preference = db.get(Setting, 'preferences')
+    return preference.value.get('scan_interval', 3600) if preference else 3600
 
 @app.post('/api/programs')
-def create_program(body: ProgramInput, db: Session = Depends(get_db)) -> dict:
-    existing = db.scalar(select(Program).where(Program.platform == body.platform, Program.platform_program_id == body.platform_program_id))
-    if existing:
-        return serialize(existing)
-    item = Program(**body.model_dump())
+async def create_program(body: ProgramInput, db: Session = Depends(get_db)) -> dict:
+    name, url = body.name.strip(), body.program_url.strip()
+    platform = body.platform.strip().lower() or 'manual'
+    if not name or not url: raise HTTPException(422, 'Name and program URL are required')
+    if platform in SOURCE_CLASSES: raise HTTPException(422, f'{platform} programs are added by syncing the source')
+    program_id = (body.platform_program_id or url).strip()
+    if db.scalar(select(Program.id).where(Program.platform == platform, Program.platform_program_id == program_id)):
+        raise HTTPException(409, 'This program already exists')
+    repos, client = [], GitHubClient()
+    try:
+        for repo_url in dict.fromkeys(x.strip() for x in body.repositories if x.strip()):
+            repo = await register_repository(db, client, repo_url)
+            if repo.last_scanned_at is None: repo.scan_interval = default_scan_interval(db)
+            repos.append(repo)
+    except (ValueError, GitHubError) as exc:
+        raise HTTPException(400, f'{repo_url}: {exc}') from exc
+    finally:
+        await client.close()
+    item = Program(name=name, platform=platform, platform_program_id=program_id, program_url=url, max_bounty=body.max_bounty or None, status=body.status)
     db.add(item); db.flush()
+    for repo in repos:
+        db.add(ProgramRepository(program_id=item.id, repository_id=repo.id, discovered_from='manual'))
     db.add(Event(event_type='NEW_PROGRAM', program_id=item.id, identity=f'{item.platform}:{item.platform_program_id}', payload={'name': item.name}))
     db.commit()
+    for repo in repos:
+        if repo.last_scanned_at is None: scan_one.delay(repo.id)
     return serialize(item)
 
 @app.delete('/api/programs/{program_id}')
@@ -128,20 +168,31 @@ def delete_program(program_id: int, db: Session = Depends(get_db)) -> dict:
 
 @app.get('/api/repositories')
 def repositories(db: Session = Depends(get_db), offset: int = 0, limit: int = Query(25, le=100), search: str = '') -> dict:
+    """Repositories with their latest release, newest release first; repositories without one come last."""
     filters = [(Repository.owner + '/' + Repository.name).ilike(f'%{search}%')] if search else []
-    return page(db, Repository, offset, limit, filters, Repository.id.desc())
+    latest = select(Release).where(Release.id.in_(latest_release_ids())).subquery()
+    query = (select(Repository, latest.c.id, latest.c.tag, latest.c.name, latest.c.published_at, latest.c.release_url)
+             .outerjoin(latest, latest.c.repository_id == Repository.id)
+             .order_by(latest.c.published_at.desc().nullslast(), latest.c.id.desc().nullslast(), Repository.id.desc()))
+    count = select(func.count()).select_from(Repository)
+    for predicate in filters:
+        query = query.where(predicate)
+        count = count.where(predicate)
+    items = [{**serialize(repo), 'latest_release': None if release_id is None else
+              {'id': release_id, 'tag': tag, 'name': name, 'published_at': published.isoformat() if published else None, 'release_url': url}}
+             for repo, release_id, tag, name, published, url in db.execute(query.offset(offset).limit(limit))]
+    return {'items': items, 'total': db.scalar(count), 'offset': offset, 'limit': limit}
 
 @app.get('/api/repositories/{repository_id}')
 def repository_detail(repository_id: int, db: Session = Depends(get_db)) -> dict:
     repo = db.get(Repository, repository_id)
     if not repo: raise HTTPException(404)
     commits = db.scalars(select(Commit).where(Commit.repository_id == repository_id).order_by(Commit.id.desc()).limit(30)).all()
-    return {**serialize(repo), 'programs': [serialize(x) for x in repo.programs], 'commits': [{**serialize(x), 'files': [serialize(f) for f in db.scalars(select(ChangedFile).where(ChangedFile.commit_id == x.id))]} for x in commits], 'releases': [serialize(x) for x in db.scalars(select(Release).where(Release.repository_id == repository_id).order_by(Release.id.desc()).limit(30))], 'tags': [serialize(x) for x in db.scalars(select(Tag).where(Tag.repository_id == repository_id).order_by(Tag.id.desc()).limit(30))], 'events': [serialize(x) for x in db.scalars(select(Event).where(Event.repository_id == repository_id).order_by(Event.id.desc()).limit(50))]}
+    return {**serialize(repo), 'programs': [serialize(x) for x in repo.programs], 'commits': [{**serialize(x), 'files': [serialize(f) for f in db.scalars(select(ChangedFile).where(ChangedFile.commit_id == x.id))]} for x in commits], 'releases': [serialize(x) for x in db.scalars(select(Release).where(Release.repository_id == repository_id, Release.id.in_(latest_release_ids())))], 'tags': [serialize(x) for x in db.scalars(select(Tag).where(Tag.repository_id == repository_id).order_by(Tag.id.desc()).limit(30))], 'events': [serialize(x) for x in db.scalars(select(Event).where(Event.repository_id == repository_id).order_by(Event.id.desc()).limit(50))]}
 
 @app.post('/api/repositories')
 async def create_repository(body: RepositoryInput, db: Session = Depends(get_db)) -> dict:
-    preference = db.get(Setting, 'preferences')
-    interval = body.scan_interval or (preference.value.get('scan_interval', 3600) if preference else 3600)
+    interval = body.scan_interval or default_scan_interval(db)
     if interval < 300: raise HTTPException(422, 'Minimum scan interval is 300 seconds')
     client = GitHubClient()
     try:
@@ -197,14 +248,55 @@ def mark_read(event_id: int, db: Session = Depends(get_db)) -> dict:
 
 @app.get('/api/releases')
 def releases(db: Session = Depends(get_db), offset: int = 0, limit: int = Query(25, le=100)) -> dict:
-    rows = db.execute(select(Release, Repository).join(Repository, Release.repository_id == Repository.id).order_by(Release.published_at.desc().nullslast(), Release.id.desc()).offset(offset).limit(limit)).all()
-    total = db.scalar(select(func.count()).select_from(Release)) or 0
+    latest = latest_release_ids().subquery()
+    rows = db.execute(select(Release, Repository).join(Repository, Release.repository_id == Repository.id).join(latest, latest.c.id == Release.id).order_by(Release.published_at.desc().nullslast(), Release.id.desc()).offset(offset).limit(limit)).all()
+    total = db.scalar(select(func.count()).select_from(latest)) or 0
     return {'items': [{**serialize(release), 'repository_name': f'{repo.owner}/{repo.name}'} for release, repo in rows], 'total': total, 'offset': offset, 'limit': limit}
 
 @app.get('/api/releases/latest-run')
 def latest_release_run(db: Session = Depends(get_db)) -> dict | None:
     entry = db.get(Setting, 'latest_release_poll')
     return entry.value if entry else None
+
+@app.get('/api/github/rate-limit')
+def github_rate_limit(db: Session = Depends(get_db)) -> dict | None:
+    return rate_limit_status(db)
+
+@app.post('/api/releases/scan', status_code=202)
+def start_release_scan(db: Session = Depends(get_db)) -> dict:
+    if limit := rate_limit_error(db):
+        raise HTTPException(429, str(limit))
+    entry = db.get(Setting, 'latest_release_poll')
+    if entry and entry.value.get('status') in {'queued', 'running', 'stopping'}:
+        started = entry.value.get('started_at')
+        if started and datetime.now(timezone.utc) - datetime.fromisoformat(started) < timedelta(hours=2):
+            raise HTTPException(409, 'A release check is already in progress')
+    run = {'id': uuid4().hex[:12], 'status': 'queued', 'started_at': datetime.now(timezone.utc).isoformat(),
+           'completed_at': None, 'total_repositories': db.scalar(select(func.count()).select_from(Repository)) or 0,
+           'checked_count': 0, 'new_release_count': 0, 'error_count': 0,
+           'notification_status': 'pending', 'stop_requested': False, 'repositories': []}
+    if entry:
+        entry.value = run
+    else:
+        db.add(Setting(key='latest_release_poll', value=run))
+    db.commit()
+    try:
+        scan_releases_now.delay(run['id'])
+    except Exception as exc:
+        entry = db.get(Setting, 'latest_release_poll')
+        entry.value = {**run, 'status': 'failed', 'completed_at': datetime.now(timezone.utc).isoformat()}
+        db.commit()
+        raise HTTPException(503, 'Could not queue the release check') from exc
+    return run
+
+@app.post('/api/releases/scan/stop')
+def stop_release_scan(db: Session = Depends(get_db)) -> dict:
+    entry = db.get(Setting, 'latest_release_poll')
+    if not entry or entry.value.get('status') not in {'queued', 'running', 'stopping'}:
+        raise HTTPException(409, 'No release check is running')
+    entry.value = {**entry.value, 'status': 'stopping', 'stop_requested': True}
+    db.commit()
+    return entry.value
 
 def serialize_source_run(run: SourceSyncRun) -> dict:
     result = serialize(run)
@@ -261,6 +353,8 @@ def pause_source_sync(run_id: int, db: Session = Depends(get_db)) -> dict:
 
 @app.post('/api/source-syncs/{run_id}/resume')
 def resume_source_sync(run_id: int, db: Session = Depends(get_db)) -> dict:
+    if limit := rate_limit_error(db):
+        raise HTTPException(429, str(limit))
     try:
         run = resume_source_run(db, get_source_run(db, run_id))
     except ValueError as exc:

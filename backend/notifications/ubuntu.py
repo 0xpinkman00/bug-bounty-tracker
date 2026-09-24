@@ -6,10 +6,13 @@ from backend.models import Event
 from backend.notifications.base import NotificationProvider
 
 log = logging.getLogger(__name__)
+UPDATE_LABELS = {'scope': 'in-scope assets', 'max_bounty': 'max payout', 'impacts': 'impacts in scope', 'known_issues': 'known findings', 'details': 'program details'}
 
 class UbuntuNotificationProvider(NotificationProvider):
     async def send(self, event: Event) -> None:
         message = event.payload.get('name') or event.payload.get('tag') or event.event_type.replace('_', ' ').title()
+        if event.event_type == 'PROGRAM_UPDATED' and event.payload.get('categories'):
+            message = f"{message} updated: {', '.join(UPDATE_LABELS.get(c, c) for c in event.payload['categories'])}"
         await self.send_text('Bug Bounty Tracker', str(message))
 
     async def send_text(self, title: str, message: str) -> bool:

@@ -2,6 +2,11 @@ import httpx
 from backend.sources.base import BountySource, SourceAsset, SourceProgram
 from backend.sources.common import github_links
 
+def is_bug_bounty(item: dict) -> bool:
+    """Ongoing bug bounties only: attackathons, audit competitions, bounty competitions and invite-only
+    programs are time-boxed events, and only those carry an end date in the catalog."""
+    return not item.get('endDate')
+
 class ImmunefiSource(BountySource):
     catalog_url = 'https://immunefi.com/public-api/bounties.json'
 
@@ -19,7 +24,7 @@ class ImmunefiSource(BountySource):
             data = response.json()
             if not isinstance(data, list):
                 raise ValueError('Immunefi catalog format changed')
-            self._programs = {item['slug']: item for item in data if isinstance(item, dict) and item.get('slug')}
+            self._programs = {item['slug']: item for item in data if isinstance(item, dict) and item.get('slug') and is_bug_bounty(item)}
         return self._programs
 
     async def list_programs(self) -> list[str]:
@@ -49,4 +54,8 @@ class ImmunefiSource(BountySource):
             assets=assets,
             repositories=sorted(repositories),
             metadata={'updated_date': item.get('updatedDate')},
+            impacts=[{'type': impact.get('type'), 'severity': impact.get('severity'), 'title': impact['title'].strip()}
+                     for impact in item.get('impacts') or [] if (impact.get('title') or '').strip()],
+            known_issues=[{'description': issue['description'].strip(), 'link': issue.get('link') or None}
+                          for issue in item.get('knownIssues') or [] if (issue.get('description') or '').strip()],
         )
