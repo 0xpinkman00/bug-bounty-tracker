@@ -50,6 +50,11 @@ def scan_releases_now(run_id: str) -> None:
     asyncio.run(poll_all_releases(run_id))
 
 @app.task
+def scan_program_now(program_id: int, run: dict) -> None:
+    from backend.services.program_scan import scan_program
+    asyncio.run(scan_program(program_id, run))
+
+@app.task
 def send_notifications() -> None:
     async def run() -> None:
         provider = UbuntuNotificationProvider()

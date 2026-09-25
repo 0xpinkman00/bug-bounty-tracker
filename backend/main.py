@@ -1,18 +1,20 @@
+import json
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterator, Literal
 from uuid import uuid4
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import select, func, case
+from sqlalchemy import String, select, func, case
 from sqlalchemy.orm import Session
 from backend.database import SessionLocal
-from backend.github.client import GitHubClient, GitHubError
+from backend.github.client import GitHubClient, GitHubError, normalize_github_url
 from backend.github.ratelimit import rate_limit_error, rate_limit_status
 from backend.github.scanner import register_repository
-from backend.models import Program, ProgramRepository, ProgramUpdate, Repository, Commit, Release, Tag, Event, Asset, ChangedFile, Setting, SourceSyncRun, now
-from backend.workers.tasks import scan_one, scan_releases_now, sync_source_run, DEFAULT_TYPES
+from backend.models import Program, ProgramRepository, ProgramSnapshot, ProgramUpdate, VulnerabilityReport, Repository, Commit, Release, Tag, Event, Asset, ChangedFile, Setting, SourceSyncRun, now
+from backend.workers.tasks import scan_one, scan_program_now, scan_releases_now, sync_source_run, DEFAULT_TYPES
+from backend.services import program_scan
 from backend.services.discovery import SOURCE_CLASSES, create_source_run, pause_source_run, resume_source_run, stop_source_run
 
 app = FastAPI(title='Bug Bounty Tracker')
@@ -35,6 +37,39 @@ class ProgramInput(BaseModel):
     status: str = 'active'
     repositories: list[str] = []
 
+Severity = Literal['critical', 'high', 'medium', 'low', 'insight']
+ReportType = Literal['Smart Contract', 'Blockchain/DLT', 'Websites and Applications']
+
+class ReportDetail(BaseModel):
+    label: str
+    value: str
+
+class ReportSection(BaseModel):
+    title: str
+    body: str
+    placement: Literal['before', 'after'] = 'after'
+
+class VulnerabilityInput(BaseModel):
+    title: str
+    severity: Severity
+    report_type: ReportType
+    target: str | None = None
+    impacts: list[str] = []
+    brief: str = ''
+    vulnerability_details: str = ''
+    impact_details: str = ''
+    references: str = ''
+    proof_of_concept: str = ''
+    recommendation: str = ''
+    details: list[ReportDetail] = []
+    extra_sections: list[ReportSection] = []
+    tags: list[str] = []
+    fix_url: str | None = None
+    source_url: str | None = None
+    reported_at: date | None = None
+    program_id: int | None = None
+    repository_id: int | None = None
+
 class SettingsInput(BaseModel):
     notifications: list[str] = DEFAULT_TYPES
     scan_interval: int = 3600
@@ -53,7 +88,7 @@ def serialize(obj) -> dict:
     result = {}
     for column in obj.__table__.columns:
         value = getattr(obj, obj.__mapper__.get_property_by_column(column).key)
-        if isinstance(value, datetime):
+        if isinstance(value, (datetime, date)):
             value = value.isoformat()
         result[column.name] = value
     return result
@@ -124,7 +159,62 @@ def program_detail(program_id: int, db: Session = Depends(get_db)) -> dict:
     if not program:
         raise HTTPException(404)
     updates = db.scalars(select(ProgramUpdate).where(ProgramUpdate.program_id == program_id).order_by(ProgramUpdate.id.desc()).limit(50))
-    return {**serialize(program), 'updates': [serialize(x) for x in updates], 'assets': [serialize(x) for x in db.scalars(select(Asset).where(Asset.program_id == program_id))], 'repositories': [serialize(x) for x in program.repositories], 'events': [serialize(x) for x in db.scalars(select(Event).where(Event.program_id == program_id).order_by(Event.id.desc()).limit(50))]}
+    snapshot = db.scalar(select(ProgramSnapshot).where(ProgramSnapshot.program_id == program_id).order_by(ProgramSnapshot.id.desc()))
+    return {**serialize(program), 'updates': [serialize(x) for x in updates], 'impacts': snapshot.raw_data.get('impacts', []) if snapshot else [], 'assets': serialize_assets(db, program), 'repositories': [serialize(x) for x in program.repositories], 'events': [serialize(x) for x in db.scalars(select(Event).where(Event.program_id == program_id).order_by(Event.id.desc()).limit(50))]}
+
+@app.get('/api/programs/{program_id}/scan')
+def program_scan_status(program_id: int, db: Session = Depends(get_db)) -> dict | None:
+    entry = db.get(Setting, program_scan.run_key(program_id))
+    return entry.value if entry else None
+
+@app.post('/api/programs/{program_id}/scan', status_code=202)
+def start_program_scan(program_id: int, db: Session = Depends(get_db)) -> dict:
+    if not db.get(Program, program_id): raise HTTPException(404)
+    if limit := rate_limit_error(db):
+        raise HTTPException(429, str(limit))
+    entry = db.get(Setting, program_scan.run_key(program_id))
+    if entry and entry.value.get('status') in program_scan.ACTIVE_STATUSES:
+        started = entry.value.get('started_at')
+        if started and datetime.now(timezone.utc) - datetime.fromisoformat(started) < timedelta(hours=1):
+            raise HTTPException(409, 'A scan of this program is already in progress')
+    run = {'id': uuid4().hex[:12], 'status': 'queued', 'started_at': datetime.now(timezone.utc).isoformat(), 'completed_at': None,
+           'program_updated': None, 'total_repositories': len(db.get(Program, program_id).repositories),
+           'checked_count': 0, 'new_release_count': 0, 'errors': []}
+    if entry:
+        entry.value = run
+    else:
+        db.add(Setting(key=program_scan.run_key(program_id), value=run))
+    db.commit()
+    try:
+        scan_program_now.delay(program_id, run)
+    except Exception as exc:
+        entry = db.get(Setting, program_scan.run_key(program_id))
+        entry.value = {**run, 'status': 'failed', 'completed_at': datetime.now(timezone.utc).isoformat()}
+        db.commit()
+        raise HTTPException(503, 'Could not queue the program scan') from exc
+    return run
+
+def asset_repository_key(asset: Asset) -> tuple[str, str] | None:
+    for value in (asset.url, asset.value):
+        try:
+            owner, name = normalize_github_url(value or '')
+            return owner.lower(), name.lower()
+        except ValueError:
+            continue
+    return None
+
+def serialize_assets(db: Session, program: Program) -> list[dict]:
+    """Scope assets, each GitHub asset with its linked repository's latest release."""
+    repositories = {(repo.owner.lower(), repo.name.lower()): repo for repo in program.repositories}
+    releases = {release.repository_id: release for release in db.scalars(select(Release).where(
+        Release.id.in_(latest_release_ids()), Release.repository_id.in_([repo.id for repo in repositories.values()])))} if repositories else {}
+    items = []
+    for asset in db.scalars(select(Asset).where(Asset.program_id == program.id)):
+        repo = repositories.get(asset_repository_key(asset))
+        release = releases.get(repo.id) if repo else None
+        items.append({**serialize(asset), 'repository_id': repo.id if repo else None,
+                      'latest_release': serialize(release) if release else None})
+    return items
 
 def default_scan_interval(db: Session) -> int:
     preference = db.get(Setting, 'preferences')
@@ -163,6 +253,7 @@ async def create_program(body: ProgramInput, db: Session = Depends(get_db)) -> d
 def delete_program(program_id: int, db: Session = Depends(get_db)) -> dict:
     item = db.get(Program, program_id)
     if not item: raise HTTPException(404)
+    if scan := db.get(Setting, program_scan.run_key(program_id)): db.delete(scan)
     db.delete(item); db.commit()
     return {'ok': True}
 
@@ -389,3 +480,90 @@ def save_settings(body: SettingsInput, db: Session = Depends(get_db)) -> dict:
     else: db.add(Setting(key='notifications', value={'enabled': body.notifications}))
     db.commit()
     return body.model_dump()
+
+
+def serialize_report(db: Session, report: VulnerabilityReport) -> dict:
+    program = db.get(Program, report.program_id) if report.program_id else None
+    repo = db.get(Repository, report.repository_id) if report.repository_id else None
+    return {**serialize(report), 'program_name': program.name if program else None,
+            'repository_name': f'{repo.owner}/{repo.name}' if repo else None}
+
+def apply_report(db: Session, report: VulnerabilityReport, body: VulnerabilityInput) -> None:
+    values = body.model_dump()
+    values['title'] = values['title'].strip()
+    if not values['title']: raise HTTPException(422, 'A title is required')
+    if body.program_id and not db.get(Program, body.program_id): raise HTTPException(422, 'Unknown program')
+    if body.repository_id and not db.get(Repository, body.repository_id): raise HTTPException(422, 'Unknown repository')
+    values['impacts'] = list(dict.fromkeys(item.strip() for item in body.impacts if item.strip()))
+    values['details'] = [{'label': row.label.strip(), 'value': row.value.strip()} for row in body.details if row.label.strip() and row.value.strip()]
+    values['extra_sections'] = [{'title': section.title.strip(), 'body': section.body.strip(), 'placement': section.placement}
+                                for section in body.extra_sections if section.title.strip() and section.body.strip()]
+    values['tags'] = list(dict.fromkeys(tag.strip() for tag in body.tags if tag.strip()))
+    for key in ('target', 'fix_url', 'source_url'):
+        values[key] = (values[key] or '').strip() or None
+    for key, value in values.items():
+        setattr(report, key, value)
+
+def report_filters(search: str = '', severity: str = '', program_id: int | None = None, repository_id: int | None = None, tag: str = '') -> list:
+    filters = []
+    # Tags are a JSON list; match the quoted value in its text form, which works on PostgreSQL and SQLite.
+    if tag: filters.append(VulnerabilityReport.tags.cast(String).like('%' + json.dumps(tag) + '%'))
+    if search: filters.append(VulnerabilityReport.title.ilike(f'%{search}%'))
+    if severity: filters.append(VulnerabilityReport.severity == severity)
+    if program_id: filters.append(VulnerabilityReport.program_id == program_id)
+    if repository_id: filters.append(VulnerabilityReport.repository_id == repository_id)
+    return filters
+
+REPORT_ORDER = (VulnerabilityReport.reported_at.desc().nullslast(), VulnerabilityReport.id.desc())
+
+@app.get('/api/vulnerabilities')
+def vulnerabilities(db: Session = Depends(get_db), offset: int = 0, limit: int = Query(25, le=100), search: str = '',
+                    severity: str = '', program_id: int | None = None, repository_id: int | None = None, tag: str = '') -> dict:
+    filters = report_filters(search, severity, program_id, repository_id, tag)
+    query = select(VulnerabilityReport).where(*filters).order_by(*REPORT_ORDER)
+    count = select(func.count()).select_from(VulnerabilityReport).where(*filters)
+    items = [serialize_report(db, report) for report in db.scalars(query.offset(offset).limit(limit))]
+    return {'items': items, 'total': db.scalar(count), 'offset': offset, 'limit': limit}
+
+@app.get('/api/vulnerabilities/{report_id}/neighbors')
+def vulnerability_neighbors(report_id: int, db: Session = Depends(get_db), search: str = '', severity: str = '',
+                            program_id: int | None = None, repository_id: int | None = None, tag: str = '') -> dict:
+    """The reports before and after this one in the list, under the same filters and order."""
+    filters = report_filters(search, severity, program_id, repository_id, tag)
+    ids = list(db.scalars(select(VulnerabilityReport.id).where(*filters).order_by(*REPORT_ORDER)))
+    if report_id not in ids: return {'previous': None, 'next': None, 'position': None, 'total': len(ids)}
+    index = ids.index(report_id)
+    return {'previous': ids[index - 1] if index > 0 else None, 'next': ids[index + 1] if index + 1 < len(ids) else None,
+            'position': index + 1, 'total': len(ids)}
+
+@app.get('/api/vulnerabilities/tags')
+def vulnerability_tags(db: Session = Depends(get_db)) -> list[str]:
+    return sorted({tag for tags in db.scalars(select(VulnerabilityReport.tags)) for tag in tags or []}, key=str.lower)
+
+@app.get('/api/vulnerabilities/{report_id}')
+def vulnerability_detail(report_id: int, db: Session = Depends(get_db)) -> dict:
+    report = db.get(VulnerabilityReport, report_id)
+    if not report: raise HTTPException(404)
+    return serialize_report(db, report)
+
+@app.post('/api/vulnerabilities', status_code=201)
+def create_vulnerability(body: VulnerabilityInput, db: Session = Depends(get_db)) -> dict:
+    report = VulnerabilityReport()
+    apply_report(db, report, body)
+    db.add(report); db.commit()
+    return serialize_report(db, report)
+
+@app.put('/api/vulnerabilities/{report_id}')
+def update_vulnerability(report_id: int, body: VulnerabilityInput, db: Session = Depends(get_db)) -> dict:
+    report = db.get(VulnerabilityReport, report_id)
+    if not report: raise HTTPException(404)
+    apply_report(db, report, body)
+    db.commit()
+    return serialize_report(db, report)
+
+@app.delete('/api/vulnerabilities/{report_id}')
+def delete_vulnerability(report_id: int, db: Session = Depends(get_db)) -> dict:
+    report = db.get(VulnerabilityReport, report_id)
+    if not report: raise HTTPException(404)
+    db.delete(report); db.commit()
+    return {'ok': True}

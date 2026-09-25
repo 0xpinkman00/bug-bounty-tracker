@@ -1,5 +1,5 @@
-from datetime import datetime, timezone
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from datetime import date, datetime, timezone
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from backend.database import Base
 
@@ -117,6 +117,33 @@ class ProgramUpdate(Base):
     categories: Mapped[list[str]] = mapped_column(JSON, default=list)
     changes: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class VulnerabilityReport(Base):
+    """A vulnerability report added by hand, laid out like an Immunefi report, to learn from fixed issues."""
+    __tablename__ = 'vulnerability_reports'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(300))
+    severity: Mapped[str] = mapped_column(String(20))
+    report_type: Mapped[str] = mapped_column(String(60))
+    target: Mapped[str | None] = mapped_column(Text)
+    impacts: Mapped[list[str]] = mapped_column(JSON, default=list)
+    brief: Mapped[str] = mapped_column(Text, default='')
+    vulnerability_details: Mapped[str] = mapped_column(Text, default='')
+    impact_details: Mapped[str] = mapped_column(Text, default='')
+    references: Mapped[str] = mapped_column(Text, default='')
+    proof_of_concept: Mapped[str] = mapped_column(Text, default='')
+    recommendation: Mapped[str] = mapped_column(Text, default='')
+    details: Mapped[list[dict]] = mapped_column(JSON, default=list)  # extra {'label', 'value'} rows, value in Markdown
+    # Sections beyond Immunefi's template: {'title', 'body', 'placement'}, placed 'before' or 'after' the description.
+    extra_sections: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    fix_url: Mapped[str | None] = mapped_column(Text)
+    source_url: Mapped[str | None] = mapped_column(Text)
+    reported_at: Mapped[date | None] = mapped_column(Date)
+    program_id: Mapped[int | None] = mapped_column(ForeignKey('programs.id', ondelete='SET NULL'), index=True)
+    repository_id: Mapped[int | None] = mapped_column(ForeignKey('repositories.id', ondelete='SET NULL'), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
 class ChangedFile(Base):
     __tablename__ = 'changed_files'
